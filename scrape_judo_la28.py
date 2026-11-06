@@ -52,6 +52,8 @@ WEIGHTS = {  # id_weight IJF -> (genere, nome)
     8: ("Donne", "-48"), 9: ("Donne", "-52"), 10: ("Donne", "-57"), 11: ("Donne", "-63"),
     12: ("Donne", "-70"), 13: ("Donne", "-78"), 14: ("Donne", "+78"),
 }
+# codici che non sono un Comitato Olimpico Nazionale (IJF = neutri, IRT = squadra rifugiati, ecc.)
+NON_NOC = {"IJF", "IRT", "AIN", "EOR", "ROT", "NOC", "NEU"}
 # codici CIO di riferimento per riconoscere i continenti IJF (id_continent) dai dati
 ANCHORS = {
     "Africa": {"ALG", "EGY", "MAR", "TUN", "RSA", "SEN", "CMR", "CIV", "NGR", "MAD", "GAB", "ANG"},
@@ -158,6 +160,23 @@ def load_ranking(notes):
         data[idw] = [a for a in athletes if not a["struck"]]
         print(f"  {WEIGHTS[idw][0]} {WEIGHTS[idw][1]} kg: {len(athletes)} atleti in classifica"
               + (f" ({len(struck)} esclusi dalla classifica IJF)" if struck else ""))
+    # atleti senza Comitato Olimpico Nazionale (neutri IJF, squadra rifugiati...): i posti per loro
+    # li decide il CIO, non il ranking, quindi restano fuori dalla simulazione
+    excluded = []
+    for idw in list(data):
+        keep = []
+        for a in data[idw]:
+            if a["noc"] in NON_NOC:
+                excluded.append(a)
+            else:
+                keep.append(a)
+        data[idw] = keep
+    if excluded:
+        sample = ", ".join(f"{a['name']} ({a['noc']}, {a['wname']} kg)" for a in excluded[:6])
+        notes.append(f"esclusi {len(excluded)} atleti senza Comitato Olimpico Nazionale "
+                     f"(IJF neutri / squadra rifugiati): {sample}"
+                     + (" ..." if len(excluded) > 6 else ""))
+        print(f"  Esclusi dalla simulazione {len(excluded)} atleti senza Comitato Olimpico Nazionale")
     allat = [a for lst in data.values() for a in lst]
     cmap = continent_names(allat, notes)
     for a in allat:
