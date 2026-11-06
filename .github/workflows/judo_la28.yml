@@ -61,4 +61,12 @@ jobs:
           else
             git commit -m "Aggiorna la simulazione dei qualificati di judo"
             git push
+            # il sito si ripubblica solo quando parte il suo flusso "Aggiorna mappa LA28": lo avvio io
+            if GH_TOKEN="$PAGES_TOKEN" gh workflow run "Aggiorna mappa LA28" \
+                 --repo "${{ github.repository_owner }}/map-q-la28"; then
+              echo "Ho avviato la pubblicazione del sito: la pagina si aggiorna entro un paio di minuti."
+            else
+              echo "ATTENZIONE: judo.json è stato salvato ma non sono riuscito ad avviare la pubblicazione del sito."
+              echo "Al token PAGES_TOKEN manca il permesso 'Actions: Read and write'. Intanto lancia a mano 'Aggiorna mappa LA28'."
+            fi
           fi
