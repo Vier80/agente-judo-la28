@@ -1,9 +1,22 @@
-"""Simulazione dei qualificati di judo a LA28 (IJF)
+"""Simulazione dei qualificati di judo a LA28 (IJF) – versione 2 del 16/11/2026
 
 Legge dal sito della federazione mondiale (ijf.org) il ranking olimpico individuale delle
 14 categorie di peso (7 uomini, 7 donne) e applica il sistema di qualificazione del CIO
 (JUD-LA28, versione del 12 maggio 2026) per simulare chi si qualificherebbe oggi.
 Scrive le righe in un database Notion e produce il file judo.json per la pagina grafica.
+
+Versione 2 (16/11/2026): il sito IJF ha cambiato veste. La vecchia interfaccia
+(www.ijf.org/internal_api/wrl_olympic) non dà più il ranking, quindi lo script leggeva
+"0 atleti in classifica". La pagina nuova (https://ijf.org/world-ranking/olympic) prende i dati da
+due interfacce nuove, che ora usa anche lo script:
+  - https://ijf.org/api/v2/Rankings?Type=olympic&IdWeight=<categoria>&PerPage=1000&Page=1
+    il ranking olimpico di una categoria (tutta in una richiesta);
+  - https://ijf.org/api/v2/UnionCountries
+    per ogni unione continentale (AJU, JUA, EJU, OJU, PJC) gli id dei Paesi che ne fanno parte:
+    da qui viene il continente, che prima arrivava insieme a ogni atleta.
+Cambia SOLO la lettura dei dati (funzioni fetch_json, fetch_category, parse_rows, load_continents,
+load_ranking). La simulazione, le righe Notion e judo.json restano come nella versione precedente.
+Se in futuro l'IJF cambiasse di nuovo, il log mostra che cosa ha risposto il sito.
 
 Variabili: NOTION_TOKEN, NOTION_DATABASE_ID.
 DRY_RUN=true: solo prova, non scrive su Notion (judo.json viene comunque creato).
@@ -32,10 +45,18 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
-API = "https://www.ijf.org/internal_api/wrl_olympic"
+# --- fonti IJF (versione 2: interfacce del sito nuovo, verificate il 16/11/2026) ---
+API_RANKING = "https://ijf.org/api/v2/Rankings"          # ranking (Type=olympic, IdWeight, PerPage, Page)
+API_UNIONI = "https://ijf.org/api/v2/UnionCountries"     # unioni continentali -> id dei Paesi
+PER_PAGINA = 1000          # massimo accettato dall'IJF: una categoria intera sta in una pagina
+MAX_PAGINE = 10            # sicurezza: non più di 10 pagine per categoria
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA, "Accept": "application/json"})
+
+# codice dell'unione continentale IJF -> nome del continente usato nella simulazione e in judo.json
+# ("OTH" = altri: squadra rifugiati IRT e atleti neutrali IJF, senza continente)
+UNIONE_CONTINENTE = {"AJU": "Africa", "JUA": "Asia", "EJU": "Europa", "OJU": "Oceania", "PJC": "Americhe"}
 
 HOST = "USA"
 END_OF_PERIOD = date(2028, 6, 12)
@@ -46,7 +67,7 @@ CONT_ORDER = ["Europa", "Asia", "Africa", "Americhe", "Oceania"]
 UNIVERSALITY_PLACES = 10
 TEAM_INVITES = ["Africa", "Asia", "Europa", "Oceania", "Americhe", "Ranking squadre miste"]
 
-WEIGHTS = {  # id_weight IJF -> (genere, nome)
+WEIGHTS = {  # id_weight IJF -> (genere, nome)  (gli id sono rimasti gli stessi nel sito nuovo)
     1: ("Uomini", "-60"), 2: ("Uomini", "-66"), 3: ("Uomini", "-73"), 4: ("Uomini", "-81"),
     5: ("Uomini", "-90"), 6: ("Uomini", "-100"), 7: ("Uomini", "+100"),
     8: ("Donne", "-48"), 9: ("Donne", "-52"), 10: ("Donne", "-57"), 11: ("Donne", "-63"),
@@ -54,14 +75,6 @@ WEIGHTS = {  # id_weight IJF -> (genere, nome)
 }
 # codici che non sono un Comitato Olimpico Nazionale (IJF = neutri, IRT = squadra rifugiati, ecc.)
 NON_NOC = {"IJF", "IRT", "AIN", "EOR", "ROT", "NOC", "NEU"}
-# codici CIO di riferimento per riconoscere i continenti IJF (id_continent) dai dati
-ANCHORS = {
-    "Africa": {"ALG", "EGY", "MAR", "TUN", "RSA", "SEN", "CMR", "CIV", "NGR", "MAD", "GAB", "ANG"},
-    "Asia": {"JPN", "KOR", "MGL", "KAZ", "UZB", "CHN", "TPE", "IRI", "KGZ", "TJK", "IND", "UAE"},
-    "Europa": {"FRA", "GER", "ITA", "ESP", "GBR", "NED", "POR", "GEO", "AUT", "BEL", "CRO", "HUN"},
-    "Oceania": {"AUS", "NZL", "FIJ", "PNG", "SAM", "GUM", "TGA", "COK", "ASA", "VAN"},
-    "Americhe": {"USA", "BRA", "CAN", "ARG", "CUB", "MEX", "COL", "CHI", "PER", "DOM", "VEN", "PUR"},
-}
 
 
 def die(msg):
@@ -70,36 +83,58 @@ def die(msg):
 
 
 # ------------------------------------------------------------------ lettura dati
-def fetch_json(params):
+def descrivi_risposta(testo):
+    """Primi caratteri di una risposta del sito, su una riga: servono nel log se qualcosa cambia."""
+    return re.sub(r"\s+", " ", str(testo))[:300]
+
+
+def fetch_json(url, params=None):
+    """Chiede un indirizzo IJF e restituisce il JSON.
+
+    Riprova fino a 4 volte (con pausa crescente) se il sito è lento, risponde con un errore del
+    server (5xx) o con qualcosa che non è JSON. Un errore 4xx (pagina inesistente, accesso negato)
+    non si risolve riprovando: lo script si ferma subito e scrive nel log la risposta del sito.
+    """
     last = None
     for attempt in range(4):
         try:
-            r = SESSION.get(API, params=params, timeout=60)
+            r = SESSION.get(url, params=params, timeout=60)
+        except requests.RequestException as e:
+            last = f"connessione non riuscita: {e}"
+        else:
+            if 400 <= r.status_code < 500:
+                raise RuntimeError(f"{url} ha risposto {r.status_code}: {descrivi_risposta(r.text)}")
             if r.status_code >= 500:
-                raise RuntimeError(f"stato {r.status_code}")
-            return r.json()
-        except Exception as e:
-            last = e
-            time.sleep(2 + 2 * attempt)
-    raise RuntimeError(f"ranking IJF non raggiungibile ({last})")
+                last = f"stato {r.status_code}: {descrivi_risposta(r.text)}"
+            else:
+                try:
+                    return r.json()
+                except ValueError:
+                    last = f"la risposta non è JSON: {descrivi_risposta(r.text)}"
+        time.sleep(2 + 2 * attempt)
+    raise RuntimeError(f"{url} non raggiungibile ({last})")
 
 
 def fetch_category(idw, notes):
-    """Tutte le righe del ranking olimpico di una categoria (paginato a 100)."""
-    rows, page = [], 0
-    while page < 40:
-        params = {"limit": 100, "page": page}
-        if idw != 1:
-            params["category"] = idw
-        data = fetch_json(params)
-        feed = data.get("feed") if isinstance(data, dict) else None
-        if not isinstance(feed, list) or not feed:
+    """Tutte le righe del ranking olimpico di una categoria (di norma una sola richiesta).
+
+    Risposta IJF: {"type": "olympic", "ranking": {"list": [...], "hasMore": vero/falso, "page": 1, ...}}
+    """
+    rows = []
+    for page in range(1, MAX_PAGINE + 1):
+        params = {"Type": "olympic", "IdWeight": idw, "PerPage": PER_PAGINA, "Page": page}
+        data = fetch_json(API_RANKING, params)
+        ranking = data.get("ranking") if isinstance(data, dict) else None
+        lista = ranking.get("list") if isinstance(ranking, dict) else None
+        if not isinstance(lista, list):
+            # formato diverso da quello atteso: lo dico chiaramente invece di contare 0 atleti
+            raise RuntimeError(f"categoria {idw}: risposta IJF in un formato inatteso: {descrivi_risposta(json.dumps(data))}")
+        rows += lista
+        if not ranking.get("hasMore") or not lista:
             break
-        rows += feed
-        if len(feed) < 100:
-            break
-        page += 1
-    mine = [r for r in rows if str(r.get("id_weight")) == str(idw)]
+    else:
+        notes.append(f"ATTENZIONE: categoria {idw}: lette {MAX_PAGINE} pagine e l'IJF ne indica altre")
+    mine = [r for r in rows if str((r.get("weightCategory") or {}).get("idWeight")) == str(idw)]
     if len(mine) != len(rows):
         notes.append(f"categoria {idw}: scartate {len(rows) - len(mine)} righe di altre categorie")
     return mine
@@ -113,45 +148,53 @@ def num(v, default=0.0):
 
 
 def parse_rows(idw, feed):
+    """Righe IJF -> atleti nel formato interno della simulazione (uguale alla versione 1)."""
     gender, wname = WEIGHTS[idw]
     out = []
     for i, r in enumerate(feed):
-        noc = str(r.get("country_ioc_code") or "").upper()
-        fam, giv = str(r.get("family_name") or "").strip(), str(r.get("given_name") or "").strip()
+        judoka = r.get("judoka") or {}
+        naz = judoka.get("nationality") or {}
+        fed = ((r.get("federation") or {}).get("country")) or {}
+        # NOC: nazionalità dell'atleta; se manca, il Paese della federazione
+        noc = str(naz.get("short") or fed.get("short") or "").upper()
+        fam = str(judoka.get("familyName") or "").strip()
+        giv = str(judoka.get("givenName") or "").strip()
         if not noc or not (fam or giv):
             continue
-        struck = str(r.get("strike_through") or "0") == "1"
         out.append({
-            "pid": str(r.get("id_person")), "name": f"{fam} {giv}".strip(), "noc": noc,
-            "country": str(r.get("country_name") or noc), "idc": str(r.get("id_continent") or ""),
-            "pts": num(r.get("sum_points")), "place": int(num(r.get("place"), i + 1)) or i + 1,
-            "order": i, "gender": gender, "wname": wname, "idw": idw, "struck": struck,
+            "pid": str(judoka.get("idJudoka")), "name": f"{fam} {giv}".strip(), "noc": noc,
+            "country": str(naz.get("name") or fed.get("name") or noc),
+            "idc": str(naz.get("idCountry") or fed.get("idCountry") or ""),   # id del Paese (per il continente)
+            "pts": num(r.get("totalPoints")), "place": int(num(r.get("place"), i + 1)) or i + 1,
+            "order": i, "gender": gender, "wname": wname, "idw": idw,
+            "struck": bool(r.get("strikeThrough")),
         })
     out.sort(key=lambda a: (a["place"], -a["pts"], a["order"]))
     return out
 
 
-def continent_names(all_athletes, notes):
-    """Dai codici dei Paesi riconosce quale id_continent corrisponde a quale continente."""
-    votes = {}
-    for a in all_athletes:
-        for name, codes in ANCHORS.items():
-            if a["noc"] in codes:
-                votes.setdefault(a["idc"], {}).setdefault(name, set()).add(a["noc"])
+def load_continents(notes):
+    """id del Paese IJF -> continente, dalle unioni continentali (api/v2/UnionCountries).
+
+    Esempio di risposta: {"AJU": [50, 79, ...], "JUA": [...], "EJU": [...], "OJU": [...], "PJC": [...], "OTH": [...]}
+    """
+    data = fetch_json(API_UNIONI)
+    if not isinstance(data, dict) or not data:
+        raise RuntimeError(f"unioni continentali IJF in un formato inatteso: {descrivi_risposta(json.dumps(data))}")
     mapping = {}
-    for idc, d in votes.items():
-        best = max(d.items(), key=lambda kv: len(kv[1]))
-        mapping[idc] = best[0]
-    seen = sorted({a["idc"] for a in all_athletes})
-    notes.append("continenti riconosciuti: " + ", ".join(f"id {k} = {v}" for k, v in sorted(mapping.items())))
-    for idc in seen:
-        if idc not in mapping:
-            notes.append(f"ATTENZIONE: continente id {idc} non riconosciuto: i suoi atleti non possono "
-                         f"prendere posti continentali")
+    for unione, paesi in data.items():
+        cont = UNIONE_CONTINENTE.get(unione, "")       # "OTH" o unioni sconosciute: nessun continente
+        for idc in paesi or []:
+            mapping[str(idc)] = cont
+    sconosciute = sorted(set(data) - set(UNIONE_CONTINENTE) - {"OTH"})
+    if sconosciute:
+        notes.append(f"ATTENZIONE: unioni IJF non riconosciute (i loro atleti non prendono posti continentali): "
+                     + ", ".join(sconosciute))
     return mapping
 
 
 def load_ranking(notes):
+    cmap = load_continents(notes)
     data = {}
     for idw in WEIGHTS:
         feed = fetch_category(idw, notes)
@@ -178,9 +221,16 @@ def load_ranking(notes):
                      + (" ..." if len(excluded) > 6 else ""))
         print(f"  Esclusi dalla simulazione {len(excluded)} atleti senza Comitato Olimpico Nazionale")
     allat = [a for lst in data.values() for a in lst]
-    cmap = continent_names(allat, notes)
     for a in allat:
         a["cont"] = cmap.get(a["idc"], "")
+    # riepilogo dei continenti: serve a controllare che l'abbinamento Paese -> continente funzioni
+    conteggio = {}
+    for a in allat:
+        conteggio[a["cont"] or "nessuno"] = conteggio.get(a["cont"] or "nessuno", 0) + 1
+    notes.append("atleti per continente: " + ", ".join(f"{k} {v}" for k, v in sorted(conteggio.items())))
+    senza = sorted({a["noc"] for a in allat if not a["cont"]})
+    if senza:
+        notes.append(f"ATTENZIONE: Paesi senza continente (non possono prendere posti continentali): {', '.join(senza)}")
     return data
 
 
@@ -195,7 +245,6 @@ def simulate(data, today=None):
     final = today >= END_OF_PERIOD
     stato_ok = "Qualificato" if final else "Provvisorio"
     notes = []
-    quota = {}      # (idw) -> list di assegnazioni
     holders = {idw: set() for idw in WEIGHTS}   # NOC con un posto nella categoria
     qualified = {idw: set() for idw in WEIGHTS}  # id atleta
     assign = []
@@ -522,9 +571,14 @@ def write_rows(mapping, rows, sim_label):
 def main():
     if not DRY_RUN and (not NOTION_TOKEN or not DATABASE_ID):
         die("mancano NOTION_TOKEN o NOTION_DATABASE_ID (controlla i Secrets su GitHub).")
-    print("Leggo il ranking olimpico IJF (ijf.org/wrl_olympic) ...")
+    print("Leggo il ranking olimpico IJF (ijf.org/api/v2/Rankings, pagina ijf.org/world-ranking/olympic) ...")
     notes = []
-    data = load_ranking(notes)
+    try:
+        data = load_ranking(notes)
+    except RuntimeError as e:
+        # il sito IJF ha risposto in modo inatteso: nel messaggio c'è che cosa ha risposto
+        die(f"non riesco a leggere il ranking olimpico IJF: {e}. Se il sito è cambiato di nuovo, "
+            "apri https://ijf.org/world-ranking/olympic e controlla che la classifica si veda.")
     if not any(data.values()):
         die("non sono riuscito a leggere nessuna classifica olimpica.")
     first = next(a for lst in data.values() for a in lst)
